@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Crystal War - 體感調校最終版</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            background-color: #09090b;
+            color: #fff;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #game-container {
+            position: relative;
+            width: 100vmin;
+            height: 177.77vmin;
+            max-width: 540px;
+            max-height: 960px;
+            border: 2px solid #3f3f46;
+            background-color: #111115;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        #hint-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(9, 9, 11, 0.95);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 10; padding: 30px; text-align: center;
+        }
+        .btn {
+            background: #06b6d4; color: #fff; border: none; padding: 15px 30px;
+            font-size: 18px; font-weight: bold; border-radius: 8px; margin-top: 20px; cursor: pointer;
+        }
+        /* 右上角即時歸零按鈕 */
+        #calibrate-btn {
+            position: absolute;
+            top: 20px; right: 20px;
+            background: rgba(63, 63, 70, 0.7);
+            border: 1px solid #71717a; color: #fff;
+            padding: 10px 15px; font-size: 14px; border-radius: 5px;
+            cursor: pointer; z-index: 5;
+        }
+        #hint {
+            position: absolute; bottom: 15px; left: 50%; transform: translateX(-50%);
+            font-size: 14px; color: #a1a1aa; pointer-events: none; text-align: center;
+            width: 90%; background: rgba(0,0,0,0.6); padding: 5px; border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="hint-overlay">
+        <h2>🚀 體感戰機系統準備</h2>
+        <p style="margin-top:10px; color:#a1a1aa;">請以最舒服的姿勢拿好手機<br>點擊下方按鈕將自動進行首次水平歸零！</p>
+        <button class="btn" onclick="initTiltControls()">校準並啟動</button>
+    </div>
+
+    <button id="calibrate-btn" onclick="calibrateHeading()" style="display:none;">補正歸零</button>
+    <canvas id="gameCanvas" width="1080" height="1920"></canvas>
+    
+    <div id="hint">【手機傾斜】控制移動 | 【右半邊偏左】對空砲 | 【右半邊偏右】對地炸彈</div>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const game = {
+    width: 1080, height: 1920,
+    spawnTimer: 0,
+    bullets: [], bombs: [], enemies: [], crystals: [], explosions: [],
+    buildings: [
+        { x: 300, y: 700, size: 140, isDestroyed: false },
+        { x: 780, y: 500, size: 140, isDestroyed: false }
+    ],
+    score: 0, kills: 0,
+    tiltX: 0, tiltY: 0,
+    // 歸零基準點紀錄
+    rawGamma: 0, rawBeta: 0,
+    baseGamma: 0, baseBeta: 0,
+    isGameOver: false
+};
+
+// ==========================================
+// 體感初始化與動態歸零 (Calibration)
+// ==========================================
+function initTiltControls() {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().then(state => {
+            if (state === 'granted') {
+                window.addEventListener('deviceorientation', handleOrientation);
+                setTimeout(calibrateHeading, 200); // 延遲一下確保抓到初始數值
+                startGame();
+            }
+        });
+    } else {
+        window.addEventListener('deviceorientation', handleOrientation);
+        setTimeout(calibrateHeading, 200);
+        startGame();
+    }
+}
+
+function handleOrientation(event) {
+    game.rawGamma = event.gamma ? event.gamma : 0;
+    game.rawBeta = event.beta ? event.beta : 0;
+
+    // 計算相對於基準點的傾斜偏移量
+    game.tiltX = game.rawGamma - game.baseGamma;
+    game.tiltY = game.rawBeta - game.baseBeta;
+}
+
+// 執行歸零：把當前角度設為 (0,0) 中心地帶
+function calibrateHeading() {
+    game.baseGamma = game.rawGamma;
+    game.baseBeta = game.rawBeta;
+}
+
+function startGame() {
+    document.getElementById('hint-overlay').style.display = 'none';
+    document.getElementById('calibrate-btn').style.display = 'block';
+    gameLoop();
+}
+
+// ==========================================
+// 物件類別定義 (Entities)
+// ==========================================
+class PlayerFighter {
+    constructor() {
+        this.x = 540; this.y = 1600; this.size = 100;
+        this.drones = []; this.history = [];
+        this.tiltSensitivity = 0.7; // 調低靈敏度，操作更絲滑穩定
+        this.isInvincible = false;
+        this.invincibleTimer = 0;
+    }
+
+    update() {
+        if (this.isInvincible) {
+            this.invincibleTimer -= 1/60;
+            if (this.invincibleTimer <= 0) this.isInvincible = false;
+        }
+
+        // 加上死區 (Dead zone) 過濾手震
+        if (Math.abs(game.tiltX) > 1.5) this.x += game.tiltX * this.tiltSensitivity * 1.8;
+        if (Math.abs(game.tiltY) > 1.5) this.y += game.tiltY * this.tiltSensitivity * 1.8;
+
+        this.x = Math.max(60, Math.min(game.width - 60, this.x));
+        this.y = Math.max(60, Math.min(game.height - 60, this.y));
+
+        this.history.unshift({ x: this.x, y: this.y });
+        if (this.history.length > 100) this.history.pop();
+        this.drones.forEach((drone, i) => {
+            const delay = (i + 1) * 15;
+            if (this.history[delay]) { drone.x = this.history[delay].x; drone.y = this.history[delay].y; }
+        });
+    }
+
+    draw() {
+        if (this.isInvincible && Math.floor(Date.now() / 100) % 2 === 0) return; // 無敵閃爍
+
+        ctx.save(); ctx.translate(this.x, this.y);
+        ctx.beginPath();
+        ctx.moveTo(0, -this.size/2); ctx.lineTo(this.size/2, this.size/2);
+        ctx.lineTo(0, this.size/3); ctx.lineTo(-this.size/2, this.size/2);
+        ctx.closePath(); ctx.fillStyle = '#64748b'; ctx.fill();
+        ctx.beginPath(); ctx.arc(0, this.size/2, 12, 0, Math.PI * 2); ctx.fillStyle = '#38bdf8'; ctx.fill();
+        ctx.restore();
+        this.drones.forEach(d => d.draw());
+    }
+
+    fireAir() {
+        game.bullets.push(new AirBullet(this.x, this.y - 60));
+        this.drones.forEach(d => game.bullets.push(new AirBullet(d.x, d.y - 20)));
+        triggerVibration(15);
+    }
+    fireGround() {
+        game.bombs.push(new GroundBomb(this.x, this.y - 60));
+        triggerVibration(25);
+    }
+    addDrone() { if (this.drones.length < 2) this.drones.push(new DroneOption()); }
+    
+    hit() {
+        if (this.isInvincible) return;
+        game.explosions.push(new VisualExplosion(this.x, this.y, '#38bdf8', 120)); // 玩家藍色大爆炸
+        triggerVibration(50);
+        // 觸發降級懲罰：僚機與武器等級減半
+        this.drones = this.drones.slice(0, Math.floor(this.drones.length / 2));
+        // 重生無敵 2 秒
+        this.isInvincible = true;
+        this.invincibleTimer = 2.0;
+        this.x = 540; this.y = 1600; // 回到安全起點
+    }
+}
+
+class DroneOption {
+    constructor() { this.x = 540; this.y = 1600; this.size = 40; }
+    draw() { ctx.beginPath(); ctx.arc(this.x, this.y, this.size/2, 0, Math.PI * 2); ctx.fillStyle = 'rgba(34, 211, 238, 0.8)'; ctx.fill(); }
+}
+
+class AirBullet {
+    constructor(x, y) { this.x = x; this.y = y; this.width = 24; this.height = 50; }
+    update() { this.y -= 1600 * (1/60); }
+    draw() { ctx.fillStyle = '#fde047'; ctx.fillRect(this.x - this.width/2, this.y - this.height/2, this.width, this.height); }
+}
+
+class GroundBomb {
+    constructor(x, y) { this.x = x; this.y = y; this.r = 25; }
+    update() { this.y -= 650 * (1/60); }
+    draw() { ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2); ctx.fillStyle = '#f97316'; ctx.fill(); }
+}
+
+// 4. 動態速度突襲敵機 (慢 -> 忽然極速衝鋒)
+class AssaultEnemy {
+    constructor(x, side) {
+        this.x = x; this.y = -100; this.size = 80; this.side = side;
+        this.time = 0;
+        this.speedY = 120; // 剛開始慢速進場
+        this.waveAmplitude = 8 + Math.random() * 8; // 隨機擺動幅度
+    }
+    update() {
+        this.time += 1/60;
+        
+        if (this.time > 1.2) {
+            // 1.2 秒後發動突襲，極速向下衝鋒
+            this.speedY += 35; 
+            this.y += this.speedY * (1/60);
+            this.x += this.side * 150 * (1/60);
+        } else {
+            // 前期偵查慢速，伴隨不規則左右擺動
+            this.y += this.speedY * (1/60);
+            this.x += this.side * 250 * (1/60) + Math.sin(this.time * 6) * this.waveAmplitude;
+        }
+    }
+    draw() {
+        ctx.fillStyle = '#ef4444'; ctx.fillRect(this.x - this.size/2, this.y - this.size/2, this.size, this.size);
+        ctx.fillStyle = '#ea580c'; ctx.fillRect(this.x - 15, this.y - 15, 30, 30);
+    }
+}
+
+class FloatingCrystal {
+    constructor(x, y) { this.x = x; this.y = y; this.r = 35; this.typeIndex = 0; }
+    changeType() { this.typeIndex = (this.typeIndex + 1) % 4; }
+    draw() {
+        const colors = ['#3b82f6', '#22c55e', '#a855f7', '#ef4444'];
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2); ctx.fillStyle = colors[this.typeIndex]; ctx.fill();
+    }
+}
+
+class VisualExplosion {
+    constructor(x, y, color, maxR = 60) { this.x = x; this.y = y; this.r = 10; this.maxR = maxR; this.life = 1.0; this.color = color; }
+    update() { this.r += (this.maxR / 20); this.life -= 0.05; }
+    draw() {
+        ctx.save(); ctx.globalAlpha = Math.max(0, this.life);
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2); ctx.fillStyle = this.color; ctx.fill();
+        ctx.restore();
+    }
+}
+
+const player = new PlayerFighter();
+
+// ==========================================
+// 直覺操作介面：右半邊再切分左右 (X軸細分)
+// ==========================================
+function handlePointerDown(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const gameX = (clientX - rect.left) * (game.width / rect.width);
+    
+    // 只有點擊右半邊 (X > 540) 才發射武器
+    if (gameX > game.width / 2) {
+        // 將右半邊再均分：中右段 (540 ~ 810) vs 最右段 (810 ~ 1080)
+        if (gameX < 810) {
+            player.fireAir();   // 靠中間：發射對空子彈
+        } else {
+            player.fireGround();  // 靠最外側邊緣：投擲對地炸彈
+        }
+    }
+}
+
+window.addEventListener('mousedown', e => handlePointerDown(e.clientX, e.clientY));
+window.addEventListener('touchstart', e => { handlePointerDown(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
+
+function triggerVibration(ms) { if (navigator.vibrate) navigator.vibrate(ms); }
+
+// ==========================================
+// 核心碰撞與擊碎判定
+// ==========================================
+function checkCollisions() {
+    // 1. 子彈 擊中 敵機
+    game.bullets.forEach((bullet, bIdx) => {
+        game.enemies.forEach((enemy, eIdx) => {
+            if (Math.abs(bullet.x - enemy.x) < (bullet.width/2 + enemy.size/2) &&
+                Math.abs(bullet.y - enemy.y) < (bullet.height/2 + enemy.size/2)) {
+                game.bullets.splice(bIdx, 1);
+                game.explosions.push(new VisualExplosion(enemy.x, enemy.y, '#ef4444', 60));
+                game.enemies.splice(eIdx, 1);
+                game.score += 100; game.kills += 1;
+            }
+        });
+    });
+
+    // 2. 戰機 撞擊 敵機 (玩家受損死亡邏輯)
+    game.enemies.forEach((enemy, eIdx) => {
+        if (!player.isInvincible && Math.hypot(player.x - enemy.x, player.y - enemy.y) < (player.size/2 + enemy.size/3)) {
+            game.enemies.splice(eIdx, 1);
+            player.hit(); // 觸發死亡降級
+        }
+    });
+
+    // 3. 炸彈 轟炸 建築
+    game.bombs.forEach((bomb, bIdx) => {
+        game.buildings.forEach(b => {
+            if (!b.isDestroyed && Math.hypot(bomb.x - b.x, bomb.y - b.y) < bomb.r + b.size/2) {
+                b.isDestroyed = true;
+                game.explosions.push(new VisualExplosion(b.x, b.y, '#eab308', 90));
+                game.crystals.push(new FloatingCrystal(b.x, b.y));
+                game.bombs.splice(bIdx, 1); game.score += 500;
+            }
+        });
+    });
+
+    // 4. 炸彈 擊中 晶體變色
+    game.bombs.forEach((bomb, bIdx) => {
+        game.crystals.forEach(c => {
+            if (Math.hypot(bomb.x - c.x, bomb.y - c.y) < bomb.r + c.r) { c.changeType(); game.bombs.splice(bIdx, 1); }
+        });
+    });
+
+    // 5. 戰機 吃到 晶體
+    game.crystals.forEach((c, cIdx) => {
+        if (Math.hypot(player.x - c.x, player.y - c.y) < player.size/2 + c.r) {
+            if (c.typeIndex === 3) player.addDrone(); // 3 = option (紅色)
+            game.score += 1000; game.crystals.splice(cIdx, 1);
+        }
+    });
+}
+
+// ==========================================
+// 遊戲主迴圈
+// ==========================================
+function gameLoop() {
+    ctx.clearRect(0, 0, game.width, game.height);
+
+    game.buildings.forEach(b => {
+        if (!b.isDestroyed) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.08)'; ctx.fillRect(b.x - b.size/2, b.y - b.size/2, b.size, b.size);
+        }
+    });
+
+    player.update(); player.draw();
+
+    game.bullets.forEach((b, idx) => { b.update(); b.draw(); if(b.y < -50) game.bullets.splice(idx,1); });
+    game.bombs.forEach((b, idx) => { b.update(); b.draw(); if(b.y < -50) game.bombs.splice(idx,1); });
+
+    // 波次生成器
+    game.spawnTimer += 1/60;
+    if (game.spawnTimer > 4.0) {
+        game.spawnTimer = 0;
+        const side = Math.random() > 0.5 ? 1 : -1;
+        const startX = side === 1 ? -60 : 1140;
+        for (let i = 0; i < 3; i++) {
+            setTimeout(() => { game.enemies.push(new AssaultEnemy(startX, side)); }, i * 400);
+        }
+    }
+
+    game.enemies.forEach((e, idx) => { e.update(); e.draw(); if(e.y > game.height + 100) game.enemies.splice(idx, 1); });
+    game.crystals.forEach(c => c.draw());
+    game.explosions.forEach((exp, idx) => { exp.update(); exp.draw(); if (exp.life <= 0) game.explosions.splice(idx, 1); });
+
+    checkCollisions();
+
+    // UI 資訊
+    ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 45px "Courier New"';
+    ctx.fillText(`SCORE: ${game.score.toString().padStart(6, '0')}`, 60, 100);
+    ctx.fillText(`KILLS: ${game.kills}`, 60, 170);
+    ctx.fillText(`DRONES: ${player.drones.length}/2`, 60, 240);
+
+    requestAnimationFrame(gameLoop);
+}
+</script>
+
+</body>
+</html>
